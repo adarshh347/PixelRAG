@@ -37,3 +37,24 @@ def test_index_without_department_metadata_raises_400():
     with pytest.raises(api.HTTPException) as exc:
         api._department_article_ids("hr")
     assert exc.value.status_code == 400
+
+
+def test_invalid_department_never_changes_search_settings():
+    from unittest.mock import Mock
+
+    from fastapi.testclient import TestClient
+
+    backend = Mock()
+    api._state.update({"backend": backend, "dimension": 2})
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/search",
+            json={
+                "queries": [{"embedding": [1.0, 0.0]}],
+                "department": "unknown",
+                "nprobe": 7,
+            },
+        )
+    assert response.status_code == 404
+    backend.set_nprobe.assert_not_called()
+    backend.raw_search.assert_not_called()

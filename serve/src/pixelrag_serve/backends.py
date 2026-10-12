@@ -35,6 +35,7 @@ class VectorBackend(Protocol):
         min_tile_height: int | None = None,
         article_ids: Any = None,
         filter_cache_key: str | None = None,
+        nprobe: int | None = None,
     ) -> list[list[SearchHit]]: ...
 
     def reconstruct(self, vids: list[int | str]) -> list[list[float] | None]: ...
@@ -113,24 +114,32 @@ class FaissBackend:
         min_tile_height=None,
         article_ids=None,
         filter_cache_key=None,
+        nprobe=None,
     ):
         # min_tile_height is post-filtered by the API from hit metadata; only
         # the article_ids pre-filter runs inside FAISS (via an IDSelector, so
         # k results are guaranteed when the filtered set has enough vectors).
         if k <= 0:
             return [[] for _ in query_vectors]
-        if article_ids is not None:
-            faiss = self._faiss
-            sel = faiss.IDSelectorBatch(
-                self._positions_for(article_ids, filter_cache_key)
+        faiss = self._faiss
+        sel = (
+            faiss.IDSelectorBatch(self._positions_for(article_ids, filter_cache_key))
+            if article_ids is not None
+            else None
+        )
+        # Request-local parameters: never mutate the shared index's nprobe,
+        # including on errors or while another request is searching.
+        if isinstance(self.index, faiss.IndexIVF):
+            params = faiss.SearchParametersIVF(
+                sel=sel,
+                nprobe=self.index.nprobe if nprobe is None else nprobe,
+                # Providing search parameters otherwise resets this to zero
+                # (unlimited), silently broadening configured IVF scans.
+                max_codes=self.index.max_codes,
             )
-            if isinstance(self.index, faiss.IndexIVF):
-                params = faiss.SearchParametersIVF(sel=sel, nprobe=self.index.nprobe)
-            else:
-                params = faiss.SearchParameters(sel=sel)
-            distances, indices = self.index.search(query_vectors, k, params=params)
         else:
-            distances, indices = self.index.search(query_vectors, k)
+            params = faiss.SearchParameters(sel=sel) if sel is not None else None
+        distances, indices = self.index.search(query_vectors, k, params=params)
         article_ids = self._meta["article_ids"]
         tile_indices = self._meta["tile_indices"]
         chunk_indices = self._meta["chunk_indices"]
@@ -234,6 +243,7 @@ class QdrantBackend:
         min_tile_height=None,
         article_ids=None,
         filter_cache_key=None,
+        nprobe=None,
     ):
         from qdrant_client import models
 

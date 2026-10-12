@@ -156,6 +156,62 @@ curl -X POST http://localhost:30001/search \
   -d '{"queries": [{"text": "What is the capital of France?"}], "n_docs": 5}'
 ```
 
+#### Bounded post-filter expansion (prototype)
+
+`/search` initially requests `n_docs` candidates per query, or `10 * n_docs`
+with `articles_only`, or `5 * n_docs` with only `min_tile_height`. When a
+post-filter leaves too few hits, this prototype retries only unfinished queries
+that received a full candidate window. Each retry requests up to twice the
+previous window, sharing the remaining allowance equally among those queries.
+It stops on sufficient hits, a short backend result, an unaffordable larger
+window, or two retries. Department pre-filters apply on every call.
+
+For an initial batch of **B requested candidate slots**, retries may request at
+most **min(3B, 10,000) additional slots across the entire request**, including
+repeated prefixes. There are at most **three `raw_search` batch calls** (up to
+96 individual query searches at the 32-query limit). The conservative total
+bound is `B + min(3B, 10,000)`, at most 330,000 slots at current API limits.
+This bounds requested candidates, not internal ANN scans or wall-clock time.
+Unused budget is possible: a single query starting at 20 gets a 40-candidate
+retry, then stops because its remaining 20 slots cannot buy a larger window.
+
+This is an explicit increase in worst-case filtered-search work from one batch
+call. **Maintainer agreement on the budget is required before submission.**
+Unfiltered requests and requests satisfied by the first batch still search once.
+FAISS receives request-local `nprobe` parameters; retries do not broaden probes
+or call the embedding model again. Each query's final window determines ranking,
+duplicate vector IDs are removed, and only final hits are hydrated. The existing
+request-wide limit of 16 on-demand renders is unchanged. Filters, approximate
+search, and budget limits can still produce fewer than `n_docs` eligible hits.
+
+Reproduce the local policy benchmark with:
+
+```bash
+uv sync --frozen --extra dev
+uv run --no-sync python tests/benchmark_filter_expansion.py --iterations 100
+```
+
+The script compares the original API at `b4fe763` with this prototype using
+shared real backend implementations, 80 synthetic vectors and fixed query
+embeddings. It uses flat FAISS and in-memory Qdrant, with no network services,
+models, or image hydration. These are local endpoint timings, not production
+latency or semantic recall measurements. After 10 warmups, median milliseconds
+over 100 requests on macOS arm64 / Python 3.12.13 were:
+
+| Case (`n_docs=2`) | Calls, original → proposed | Requested candidates | Eligible hits | FAISS ms | Qdrant ms |
+| --- | --- | --- | --- | --- | --- |
+| Unfiltered | 1 → 1 | 2 → 2 | 2 → 2 | 0.552 → 0.551 | 0.475 → 0.484 |
+| First batch sufficient | 1 → 1 | 20 → 20 | 2 → 2 | 0.613 → 0.578 | 0.578 → 0.633 |
+| First eligible at rank 21 | 1 → 2 | 20 → 60 | 0 → 2 | 0.524 → 0.741 | 0.569 → 0.840 |
+| No eligible hits | 1 → 2 | 20 → 60 | 0 → 0 | 0.579 → 0.744 | 0.557 → 0.828 |
+| First eligible at rank 41 (capped) | 1 → 2 | 20 → 60 | 0 → 0 | 0.566 → 0.728 | 0.532 → 0.814 |
+| Three queries, first eligible at rank 21 | 1 → 2 | 60 → 180 | 0 → 6 | 0.638 → 0.878 | 0.811 → 1.594 |
+
+Calls, candidate slots, and hit counts above match for both backends. Returned
+candidate counts equal requested counts in this corpus; repeated prefixes are
+counted each time. Small timing differences on unchanged paths are measurement
+noise, not evidence of a speed improvement.
+
 ### Build an index from your own documents
 
 Works on **Linux (CUDA)** and **macOS (Apple Silicon / MPS)** — `device: auto` picks the best backend.

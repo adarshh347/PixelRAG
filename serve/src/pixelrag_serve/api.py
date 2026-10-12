@@ -184,8 +184,8 @@ class SearchRequest(BaseModel):
     articles_only: bool = False  # drop Wikipedia meta pages (Portal:, List_of_, …)
     # Restrict search to one department (articles.json "department" field, set by
     # `pixelrag index build` from the source directory layout). Pre-filters inside
-    # FAISS via an IDSelector — not a post-filter, so n_docs results are guaranteed
-    # when the department has enough tiles.
+    # FAISS via an IDSelector. Combined post-filters still have a bounded
+    # candidate window and may return fewer than n_docs hits.
     department: str | None = None
 
 
@@ -282,6 +282,12 @@ _MAX_IMAGE_PIXELS = 25_000_000
 # Most on-demand renders one /search request may trigger (see the search handler).
 # A real caller asks for n_docs=10 with include_images, so this is generous.
 _MAX_ONDEMAND_RENDERS = 16
+
+# Prototype budget, pending maintainer agreement. The initial batch is unchanged;
+# retries spend at most min(3 * initial candidate slots, 10_000) across ALL queries,
+# counting repeated prefixes. At most two extra raw_search calls (three total).
+_MAX_EXPANSION_CANDIDATES = 10_000
+_MAX_EXPANSION_ROUNDS = 2
 
 
 def _parse_queries(
@@ -529,6 +535,59 @@ def _resolve_url(article_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _search_candidates(backend, query_vectors, req, article_filter):
+    """Select final ranked hits before any path/image hydration.
+
+    Re-query only insufficient, non-exhausted rows, sharing the remaining
+    allowance equally. Replacing each ranked window (rather than appending
+    prefixes) preserves backend ordering even if an approximate search changes
+    its ordering at larger k. A short result exhausts this search configuration,
+    not necessarily the underlying corpus; nprobe is never increased.
+    """
+    multiplier = 10 if req.articles_only else 5 if req.min_tile_height else 1
+    fetch_k = req.n_docs * multiplier
+    remaining = min(3 * len(query_vectors) * fetch_k, _MAX_EXPANSION_CANDIDATES)
+    options = dict(
+        min_tile_height=req.min_tile_height,
+        article_ids=article_filter,
+        filter_cache_key=f"dept:{req.department}" if req.department else None,
+        nprobe=req.nprobe,
+    )
+    selected = [[] for _ in query_vectors]
+    active = list(range(len(query_vectors)))
+    for round_index in range(_MAX_EXPANSION_ROUNDS + 1):
+        if not active:
+            break
+        raw = backend.raw_search(query_vectors[active], fetch_k, **options)
+        pending = []
+        for qi, candidates in zip(active, raw, strict=True):
+            hits = []
+            seen = set()
+            for hit in candidates:
+                if hit["vector_id"] in seen:
+                    continue
+                seen.add(hit["vector_id"])
+                if req.min_tile_height and hit["tile_height"] < req.min_tile_height:
+                    continue
+                if req.articles_only and _is_meta(_resolve_url(hit["article_id"])):
+                    continue
+                hits.append(hit)
+                if len(hits) == req.n_docs:
+                    break
+            selected[qi] = hits
+            if len(hits) < req.n_docs and len(candidates) >= fetch_k:
+                pending.append(qi)
+        if multiplier == 1 or not pending or round_index == _MAX_EXPANSION_ROUNDS:
+            break
+        next_k = min(2 * fetch_k, remaining // len(pending))
+        if next_k <= fetch_k:
+            break
+        remaining -= next_k * len(pending)
+        active = pending
+        fetch_k = next_k
+    return selected
+
+
 @app.post("/search", response_model=SearchResponse)
 async def search(req: SearchRequest, request: Request):
     t0 = time.time()
@@ -547,33 +606,13 @@ async def search(req: SearchRequest, request: Request):
 
     # Search through the configured backend.
     backend = _state["backend"]
-    backend.set_nprobe(req.nprobe)
-
-    # Over-fetch when filtering to ensure enough results after filtering.
-    # Meta pages can be the majority of raw hits, so articles_only needs more.
-    if req.articles_only:
-        fetch_k = req.n_docs * 10
-    elif req.min_tile_height:
-        fetch_k = req.n_docs * 5
-    else:
-        fetch_k = req.n_docs
     article_filter = None
     if req.department:
         # Department pre-filter: the backend scores only that department's
-        # vectors (FAISS: IDSelector; Qdrant: payload filter) — a real
-        # pre-filter, not post-filtering, so n_docs results are guaranteed
-        # when the department has enough tiles.
+        # vectors (FAISS: IDSelector; Qdrant: payload filter). Keep the same
+        # pre-filter on every expansion round.
         article_filter = _department_article_ids(req.department)
-    try:
-        raw = backend.raw_search(
-            query_vectors,
-            fetch_k,
-            min_tile_height=req.min_tile_height,
-            article_ids=article_filter,
-            filter_cache_key=f"dept:{req.department}" if req.department else None,
-        )
-    finally:
-        backend.reset_nprobe()
+    raw = _search_candidates(backend, query_vectors, req, article_filter)
     t_search = time.time() - t0 - t_encode
 
     # Build results
@@ -598,12 +637,8 @@ async def search(req: SearchRequest, request: Request):
         for r in raw[qi]:
             vid = r["vector_id"]
             th = r["tile_height"]
-            if req.min_tile_height and th < req.min_tile_height:
-                continue
             aid = r["article_id"]
             url = _resolve_url(aid)
-            if req.articles_only and _is_meta(url):
-                continue
             ti = r["tile_index"]
             ci = r["chunk_index"]
             tile_path = _resolve_path(aid, ti, ci)

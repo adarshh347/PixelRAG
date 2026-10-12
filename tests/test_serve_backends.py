@@ -84,6 +84,17 @@ def ivf_faiss_backend(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+def pq_faiss_backend(tmp_path_factory):
+    index = faiss.IndexIVFPQ(
+        faiss.IndexFlatIP(DIM), DIM, NLIST, 2, 2, faiss.METRIC_INNER_PRODUCT
+    )
+    index.train(VECTORS)
+    index.add(VECTORS)
+    index.nprobe = NLIST
+    return _faiss_backend_for(index, tmp_path_factory.mktemp("pq_index"))
+
+
+@pytest.fixture(scope="module")
 def qdrant_backend():
     pytest.importorskip("qdrant_client", reason="qdrant extra not installed")
     from pixelrag_serve.backends import QdrantBackend
@@ -198,3 +209,115 @@ def test_reconstruct_non_integer_id_is_none(faiss_backend):
 
 def test_k_zero_returns_empty(backend):
     assert backend.raw_search(VECTORS[0:1], 0) == [[]]
+
+
+@pytest.mark.parametrize("article_ids", [None, HR_ARTICLES])
+def test_request_local_nprobe(backend, article_ids):
+    default = backend.nprobe
+    first = backend.raw_search(VECTORS[0:1], 3, article_ids=article_ids)
+    backend.raw_search(VECTORS[0:1], 3, article_ids=article_ids, nprobe=1)
+    assert backend.nprobe == default
+    assert backend.raw_search(VECTORS[0:1], 3, article_ids=article_ids) == first
+
+
+def test_failed_search_keeps_default_nprobe(ivf_faiss_backend, monkeypatch):
+    backend = ivf_faiss_backend
+    default = backend.nprobe
+
+    def fail(*args, **kwargs):
+        assert backend.nprobe == default
+        assert kwargs["params"].nprobe == 1
+        raise RuntimeError("search failed")
+
+    monkeypatch.setattr(backend.index, "search", fail)
+    with pytest.raises(RuntimeError, match="search failed"):
+        backend.raw_search(VECTORS[0:1], 3, nprobe=1)
+    assert backend.nprobe == default
+
+
+@pytest.mark.parametrize("nprobe", [None, NLIST])
+@pytest.mark.parametrize("fixture", ["ivf_faiss_backend", "pq_faiss_backend"])
+def test_request_parameters_preserve_ivf_scan_limit(
+    request, fixture, monkeypatch, nprobe
+):
+    backend = request.getfixturevalue(fixture)
+    monkeypatch.setattr(backend.index, "max_codes", 1)
+    _, expected = backend.index.search(VECTORS[0:1], N_VECTORS)
+    hits = backend.raw_search(VECTORS[0:1], N_VECTORS, nprobe=nprobe)[0]
+    assert [h["vector_id"] for h in hits] == [int(i) for i in expected[0] if i != -1]
+
+
+@pytest.mark.parametrize("article_ids", [None, ENG_ARTICLES, HR_ARTICLES])
+def test_pq_request_settings_and_ranking(pq_faiss_backend, monkeypatch, article_ids):
+    backend = pq_faiss_backend
+    # IVF parameters must retain the index's PQ-specific filtering settings.
+    monkeypatch.setattr(backend.index, "polysemous_ht", 1)
+    _, expected = backend.index.search(VECTORS[0:1], N_VECTORS)
+    expected_ids = [
+        int(i)
+        for i in expected[0]
+        if i != -1 and (article_ids is None or ARTICLE_OF[i] in article_ids)
+    ]
+    hits = backend.raw_search(
+        VECTORS[0:1], N_VECTORS, article_ids=article_ids, nprobe=NLIST
+    )[0]
+    assert [h["vector_id"] for h in hits] == expected_ids
+
+
+def test_api_expansion_with_real_department_prefilter(backend, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from pixelrag_serve import api
+
+    # The last-ranked HR tile alone meets the height filter. FAISS must
+    # expand past its initial five; Qdrant applies height before ranking.
+    ranked = backend.raw_search(VECTORS[0:1], 6, article_ids=HR_ARTICLES)[0]
+    target = int(ranked[-1]["vector_id"])
+    if isinstance(backend, FaissBackend):
+        meta = dict(backend._meta)
+        meta["tile_heights"] = meta["tile_heights"].copy()
+        meta["tile_heights"][target] = 1000
+        monkeypatch.setattr(backend, "_meta", meta)
+    else:
+        backend.client.set_payload(backend.collection, {"tile_height": 1000}, [target])
+    calls = []
+    original = backend.raw_search
+
+    def counted(*args, **kwargs):
+        calls.append(args[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "raw_search", counted)
+    monkeypatch.setattr(
+        api,
+        "_state",
+        {
+            "backend": backend,
+            "dimension": DIM,
+            "articles": [f"Article_{i}" for i in range(4)],
+            "dept_to_aids": {"hr": HR_ARTICLES},
+            "tiles_dir": str(tmp_path),
+        },
+    )
+    api._article_pages.cache_clear()
+    try:
+        with TestClient(api.app) as client:
+            response = client.post(
+                "/search",
+                json={
+                    "queries": [{"embedding": VECTORS[0].tolist()}],
+                    "n_docs": 1,
+                    "department": "hr",
+                    "min_tile_height": 1000,
+                    "nprobe": NLIST,
+                },
+            )
+        assert response.status_code == 200, response.text
+        hits = response.json()["results"][0]["hits"]
+        assert [int(h["vector_id"]) for h in hits] == [target]
+        assert calls == ([5, 10] if isinstance(backend, FaissBackend) else [5])
+    finally:
+        api._article_pages.cache_clear()
+        if not isinstance(backend, FaissBackend):
+            backend.client.set_payload(
+                backend.collection, {"tile_height": ranked[-1]["tile_height"]}, [target]
+            )
