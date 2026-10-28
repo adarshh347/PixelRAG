@@ -1,0 +1,18 @@
+[
+  {
+    "boundary": "before",
+    "signal": "SIGKILL",
+    "published_at_death": false,
+    "orphan_directories": 1,
+    "retry": "successful clean rebuild; orphan retained",
+    "readable_vectors": 487
+  },
+  {
+    "boundary": "after",
+    "signal": "SIGKILL",
+    "published_at_death": true,
+    "orphan_directories": 1,
+    "retry": "existing published output rejected and unchanged",
+    "readable_vectors": 487
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "stage": "metadata",
+    "partial_destination": false,
+    "staging_cleaned": true,
+    "retry_vectors": 487
+  },
+  {
+    "stage": "index",
+    "partial_destination": false,
+    "staging_cleaned": true,
+    "retry_vectors": 487
+  },
+  {
+    "stage": "summary",
+    "partial_destination": false,
+    "staging_cleaned": true,
+    "retry_vectors": 487
+  },
+  {
+    "stage": "rename",
+    "partial_destination": false,
+    "staging_cleaned": true,
+    "retry_vectors": 487
+  }
+]
