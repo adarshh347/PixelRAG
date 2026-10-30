@@ -48,11 +48,22 @@ bindings and formatting were cleaned up; the fixture scope is unchanged.
 
 ## What evidence does not support
 
-No production speedup, semantic QA improvement, representative recall, Linux
-validation, constant total RAM, power-loss durability, concurrent builders,
+No production speedup, semantic QA improvement, representative recall, constant total RAM, power-loss durability, concurrent builders,
 or general recovery guarantee is established. Synthetic PQ neighbor overlap
 was poor. Largest compressed shard and final index still consume memory.
 No browser, embedding model or paid API is required for these experiments.
 
 Maintainer decisions remain: acceptable input/shard contract, representative
 vector corpus, sampling policy, dedup costs, and ownership/durability of output.
+
+## Linux correctness validation
+
+[Ubuntu x86-64 run](https://github.com/adarshh347/PixelRAG/actions/runs/41004308055)
+validated commit b4925e8 on 2026-10-30: all three audits and 47 neighboring tests
+passed (Python 3.12.15, NumPy 2.4.5, FAISS 1.14.2). This is not a Linux memory
+benchmark. The fork-only workflow uploads JSON and JUnit artifacts for 30 days.
+Native Linux ARM64 installation remains blocked by the locked cef-capi-py wheel
+availability; x86-64 results do not claim ARM64 support.
+
+See REPRESENTATIVE-EVALUATION.md for the proposed next experiment and its
+missing raw-vector/query inputs. It is a protocol, not completed quality evidence.
