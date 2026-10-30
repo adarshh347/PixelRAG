@@ -1,0 +1,49 @@
+name: Experimental memory evidence
+
+on:
+  push:
+    branches: [codex/memory-evidence-package]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    if: github.repository == 'adarshh347/PixelRAG'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      UV_HTTP_TIMEOUT: '120'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.13.0'
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Record environment
+        run: |
+          mkdir -p evidence
+          { uname -a; python --version; uv --version; git rev-parse HEAD; } > evidence/environment.txt
+      - name: Install locked development dependencies
+        run: uv sync --locked --extra dev
+      - name: Matched training control
+        run: uv run --no-sync python benchmarks/audit_matched_training.py evidence/matched.json
+      - name: Handled failure recovery
+        run: uv run --no-sync python benchmarks/audit_failure_recovery.py evidence/failure.json
+      - name: Abrupt termination recovery
+        run: uv run --no-sync python benchmarks/audit_abrupt_recovery.py evidence/abrupt.json
+      - name: Neighboring regression tests
+        run: >-
+          uv run --no-sync pytest -q
+          tests/test_index_build_memory.py tests/test_ivfpq_index.py
+          tests/test_serve_backends.py tests/test_serve_reconstruct.py
+          tests/test_department_search.py --junitxml=evidence/tests.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: memory-evidence-linux
+          path: evidence/
+          retention-days: 30
